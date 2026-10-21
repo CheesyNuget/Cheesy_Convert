@@ -81,7 +81,7 @@ var __privateMethod = (obj, member, method) => {
 __export(exports, {
   default: () => PDFToMDPlugin
 });
-var import_obsidian5 = __toModule(require("obsidian"));
+var import_obsidian6 = __toModule(require("obsidian"));
 
 // node_modules/pdfjs-dist/legacy/build/pdf.mjs
 var import_meta = {};
@@ -32064,6 +32064,7 @@ var MODEL_OPTIONS = [
   { id: "openai-gpt-4.1-mini", name: "OpenAI GPT-4.1 Mini", provider: "openai", apiModel: "gpt-4.1-mini" },
   { id: "openai-gpt-5.4-mini", name: "OpenAI GPT-5.4 Mini", provider: "openai", apiModel: "gpt-5.4-mini" },
   { id: "openai-gpt-5.4", name: "OpenAI GPT-5.4", provider: "openai", apiModel: "gpt-5.4" },
+  { id: "gemini-3.5-flash-lite", name: "Google Gemini 3.5 Flash-Lite", provider: "gemini", apiModel: "gemini-3.5-flash-lite" },
   { id: "gemini-3.5-flash", name: "Google Gemini 3.5 Flash", provider: "gemini", apiModel: "gemini-3.5-flash" },
   { id: "gemini-2.5-flash", name: "Google Gemini 2.5 Flash", provider: "gemini", apiModel: "gemini-2.5-flash" },
   { id: "gemini-2.5-flash-lite", name: "Google Gemini 2.5 Flash-Lite Preview 06-17", provider: "gemini", apiModel: "gemini-2.5-flash-lite-preview-06-17" },
@@ -32087,7 +32088,10 @@ var DEFAULT_SETTINGS = {
   localModel: "glm-ocr:bf16",
   dpi: 150,
   timeout: 60,
-  conflictResolution: "by-model"
+  conflictResolution: "by-model",
+  formatEnabled: true,
+  formatFolder: "Formatted Notes",
+  keepRawFile: true
 };
 var PDFToMDSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
@@ -32150,6 +32154,18 @@ var PDFToMDSettingTab = class extends import_obsidian.PluginSettingTab {
     }));
     new import_obsidian.Setting(containerEl).setName("File Conflict Resolution").setDesc("What to do if output file already exists").addDropdown((dropdown) => dropdown.addOption("overwrite", "Overwrite existing file").addOption("skip", "Skip (do not generate)").addOption("timestamp", "Add timestamp (e.g., file_20250515_110430.md)").addOption("by-model", "Add model name (e.g., file_qwen.md) - Recommended").setValue(this.plugin.settings.conflictResolution).onChange(async (value) => {
       this.plugin.settings.conflictResolution = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Format and tag with Gemini").setDesc('After conversion, send the text to gemini-3.5-flash-lite in a separate request to clean up formatting, add tags and tick-box "look into this" items. Needs GEMINI_API_KEY.').addToggle((toggle) => toggle.setValue(this.plugin.settings.formatEnabled).onChange(async (value) => {
+      this.plugin.settings.formatEnabled = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Formatted notes folder").setDesc("Vault folder for the formatted note (same file name as the PDF). Created if missing.").addText((text) => text.setPlaceholder("Formatted Notes").setValue(this.plugin.settings.formatFolder).onChange(async (value) => {
+      this.plugin.settings.formatFolder = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Keep raw conversion").setDesc("Also save the unformatted OCR markdown next to the PDF.").addToggle((toggle) => toggle.setValue(this.plugin.settings.keepRawFile).onChange(async (value) => {
+      this.plugin.settings.keepRawFile = value;
       await this.plugin.saveSettings();
     }));
   }
@@ -32444,8 +32460,109 @@ var PDFConverter = class {
   }
 };
 
-// src/providers/openai-compat.ts
+// src/formatter.ts
 var import_obsidian3 = __toModule(require("obsidian"));
+var FORMAT_MODEL = "gemini-3.5-flash-lite";
+var TRIGGER_RE = /look(?:ing)?\s+into\s+this/i;
+var SYSTEM_PROMPT = `You are a note formatter for Obsidian. You receive raw Markdown that was OCR-transcribed from handwritten notes. Return a cleaned-up version plus tags.
+
+Formatting rules:
+1. Do NOT add, remove, summarise or reword content. Only fix structure and formatting. You may fix obvious OCR typos and broken line wraps.
+2. Add a clear heading hierarchy (#, ##, ###) where the notes imply sections. Do not invent a title that is not implied by the content.
+3. Turn run-on or fragmented lines into proper bullet lists or numbered lists where the structure is clearly a list. Use consistent indentation for nested items.
+4. Keep tables as Markdown tables.
+5. Preserve all LaTeX exactly: $...$ inline and $$...$$ for blocks.
+6. Remove stray page markers, duplicated blank lines and trailing whitespace.
+7. Any item, line or section the author marked with the note "look into this" (or very close wording) must become a task checkbox: "- [ ] <the item text>". Keep the words "look into this" at the end of that item, in parentheses. Do not tick the box.
+8. Do not wrap the output in code fences.
+
+Tag rules:
+- Return 3 to 6 tags describing the subject matter (topic, field, type of note).
+- Lowercase, hyphen-separated, no spaces, no leading #. Example: control-theory, lecture-notes.`;
+async function formatMarkdown(rawMarkdown, apiKey, timeoutMs) {
+  const body = {
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: "user", parts: [{ text: rawMarkdown }] }],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          markdown: { type: "STRING" },
+          tags: { type: "ARRAY", items: { type: "STRING" } }
+        },
+        required: ["markdown", "tags"]
+      }
+    }
+  };
+  const request = (0, import_obsidian3.requestUrl)({
+    url: `https://generativelanguage.googleapis.com/v1beta/models/${FORMAT_MODEL}:generateContent`,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify(body),
+    throw: false
+  });
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Formatting request timeout")), timeoutMs));
+  const response = await Promise.race([request, timeout]);
+  if (response.status >= 400) {
+    throw new Error(`Gemini API Error ${response.status}: ${response.text.substring(0, 300)}`);
+  }
+  const parts = response.json?.candidates?.[0]?.content?.parts ?? [];
+  const text = parts.filter((p) => !p.thought).map((p) => p.text ?? "").join("").trim();
+  if (!text) {
+    throw new Error("Gemini returned an empty formatting response");
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return {
+      markdown: String(parsed.markdown ?? "").trim() || rawMarkdown,
+      tags: cleanTags(parsed.tags)
+    };
+  } catch {
+    return { markdown: text, tags: [] };
+  }
+}
+function cleanTags(tags) {
+  if (!Array.isArray(tags))
+    return [];
+  const seen = new Set();
+  for (const t of tags) {
+    const tag = String(t).toLowerCase().trim().replace(/^#+/, "").replace(/\s+/g, "-").replace(/[^a-z0-9/_-]/g, "");
+    if (tag)
+      seen.add(tag);
+  }
+  return Array.from(seen).slice(0, 6);
+}
+function checkboxLookIntoThis(markdown) {
+  return markdown.split("\n").map((line) => {
+    if (!TRIGGER_RE.test(line))
+      return line;
+    if (/^\s*[-*+]\s+\[[ xX]\]/.test(line))
+      return line;
+    if (/^#{1,6}\s/.test(line))
+      return line;
+    const item = line.match(/^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/);
+    if (item)
+      return `${item[1]}- [ ] ${item[2]}`;
+    return `- [ ] ${line.trim()}`;
+  }).join("\n");
+}
+function buildNote(markdown, tags, sourceName) {
+  const lines = ["---"];
+  if (tags.length) {
+    lines.push("tags:");
+    tags.forEach((t) => lines.push(`  - ${t}`));
+  }
+  lines.push(`source: "[[${sourceName}]]"`, "---", "");
+  return lines.join("\n") + checkboxLookIntoThis(markdown) + "\n";
+}
+
+// src/providers/openai-compat.ts
+var import_obsidian4 = __toModule(require("obsidian"));
 var OpenAICompatibleProvider = class {
   constructor(config, baseUrl) {
     this.apiKey = config.apiKey;
@@ -32481,7 +32598,7 @@ var OpenAICompatibleProvider = class {
     if (this.apiKey) {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
-    const response = await (0, import_obsidian3.requestUrl)({
+    const response = await (0, import_obsidian4.requestUrl)({
       url: `${this.baseUrl}/chat/completions`,
       method: "POST",
       headers,
@@ -32519,7 +32636,7 @@ var OpenAICompatibleProvider = class {
 };
 
 // src/providers/anthropic.ts
-var import_obsidian4 = __toModule(require("obsidian"));
+var import_obsidian5 = __toModule(require("obsidian"));
 var AnthropicProvider = class {
   constructor(config) {
     this.apiKey = config.apiKey;
@@ -32560,7 +32677,7 @@ var AnthropicProvider = class {
         }
       ]
     };
-    const response = await (0, import_obsidian4.requestUrl)({
+    const response = await (0, import_obsidian5.requestUrl)({
       url: "https://api.anthropic.com/v1/messages",
       method: "POST",
       headers: {
@@ -32588,7 +32705,7 @@ var AnthropicProvider = class {
 };
 
 // main.ts
-var PDFToMDPlugin = class extends import_obsidian5.Plugin {
+var PDFToMDPlugin = class extends import_obsidian6.Plugin {
   constructor() {
     super(...arguments);
     this.apiKeys = new Map();
@@ -32603,7 +32720,7 @@ var PDFToMDPlugin = class extends import_obsidian5.Plugin {
     this.addSettingTab(new PDFToMDSettingTab(this.app, this));
     const supportedImageExtensions = ["png", "jpg", "jpeg", "webp"];
     this.registerEvent(this.app.workspace.on("file-menu", (menu, file, source) => {
-      if (!(file instanceof import_obsidian5.TFile))
+      if (!(file instanceof import_obsidian6.TFile))
         return;
       if (file.extension === "pdf") {
         menu.addItem((item) => item.setTitle("Convert to Markdown").setIcon("file-text").onClick(() => this.convertFile(file)));
@@ -32620,7 +32737,7 @@ var PDFToMDPlugin = class extends import_obsidian5.Plugin {
     }));
   }
   async loadApiKeys() {
-    if (import_obsidian5.Platform.isIosApp) {
+    if (import_obsidian6.Platform.isIosApp) {
       const secretStorage = this.app.secretStorage;
       if (secretStorage) {
         const providers = ["openai", "qwen", "gemini", "claude", "local"];
@@ -32677,7 +32794,7 @@ var PDFToMDPlugin = class extends import_obsidian5.Plugin {
       const isPdf = file.extension === "pdf";
       const isImage = ["png", "jpg", "jpeg", "webp"].includes(file.extension.toLowerCase());
       if (!isPdf && !isImage) {
-        new import_obsidian5.Notice("\u274C Unsupported file type. Only PDF, PNG, JPG, JPEG, and WebP are supported.", 5e3);
+        new import_obsidian6.Notice("\u274C Unsupported file type. Only PDF, PNG, JPG, JPEG, and WebP are supported.", 5e3);
         return;
       }
       const apiKey = this.getApiKey(this.settings.provider) ?? "";
@@ -32696,7 +32813,7 @@ var PDFToMDPlugin = class extends import_obsidian5.Plugin {
         };
         const envVar = envVarMap[this.settings.provider] ?? "API_KEY";
         const providerName = providerNameMap[this.settings.provider] ?? this.settings.provider;
-        new import_obsidian5.Notice(`\u274C ${providerName} API Key not configured!
+        new import_obsidian6.Notice(`\u274C ${providerName} API Key not configured!
 
 Please set environment variable: ${envVar}
 
@@ -32704,7 +32821,7 @@ Then restart Obsidian.`, 1e4);
         console.error(`API Key missing. Environment variable: ${envVar}`);
         return;
       }
-      notice = new import_obsidian5.Notice(`Starting ${isPdf ? "PDF" : "Image"} conversion...`, 0);
+      notice = new import_obsidian6.Notice(`Starting ${isPdf ? "PDF" : "Image"} conversion...`, 0);
       const data = await this.app.vault.readBinary(file);
       const provider = this.createProvider(apiKey);
       const converter = new PDFConverter(provider, {
@@ -32726,17 +32843,49 @@ Then restart Obsidian.`, 1e4);
       } else {
         markdown = await converter.convertImageBuffer(data);
       }
-      const outputPath = this.getOutputPath(file);
-      const existingFile = this.app.vault.getAbstractFileByPath(outputPath);
-      if (existingFile && this.settings.conflictResolution === "skip") {
-        notice.hide();
-        new import_obsidian5.Notice(`File already exists: ${outputPath}. Skipped.`, 5e3);
-        return;
+      let formattedNote = null;
+      if (this.settings.formatEnabled) {
+        const geminiKey = this.getApiKey("gemini");
+        if (!geminiKey) {
+          new import_obsidian6.Notice("\u26A0\uFE0F GEMINI_API_KEY not found, skipping formatting. Raw conversion will be saved.", 8e3);
+        } else {
+          try {
+            notice.setMessage("Formatting and tagging...");
+            const result = await formatMarkdown(markdown, geminiKey, this.settings.timeout * 1e3);
+            formattedNote = buildNote(result.markdown, result.tags, file.name);
+          } catch (e) {
+            console.error("Formatting error:", e);
+            new import_obsidian6.Notice(`\u26A0\uFE0F Formatting failed (${e instanceof Error ? e.message : e}). Raw conversion saved instead.`, 1e4);
+          }
+        }
       }
-      if (existingFile && existingFile instanceof import_obsidian5.TFile) {
-        await this.app.vault.modify(existingFile, markdown);
-      } else {
-        await this.app.vault.create(outputPath, markdown);
+      const saveRaw = !this.settings.formatEnabled || formattedNote === null || this.settings.keepRawFile;
+      let outputPath = "";
+      if (saveRaw) {
+        outputPath = this.getOutputPath(file);
+        const existingFile = this.app.vault.getAbstractFileByPath(outputPath);
+        if (existingFile && this.settings.conflictResolution === "skip") {
+          notice.hide();
+          new import_obsidian6.Notice(`File already exists: ${outputPath}. Skipped.`, 5e3);
+          return;
+        }
+        if (existingFile && existingFile instanceof import_obsidian6.TFile) {
+          await this.app.vault.modify(existingFile, markdown);
+        } else {
+          await this.app.vault.create(outputPath, markdown);
+        }
+      }
+      if (formattedNote !== null) {
+        const folder = (0, import_obsidian6.normalizePath)(this.settings.formatFolder || "Formatted Notes");
+        await this.ensureFolder(folder);
+        const formattedPath = `${folder}/${file.basename}.md`;
+        const existingFormatted = this.app.vault.getAbstractFileByPath(formattedPath);
+        if (existingFormatted instanceof import_obsidian6.TFile) {
+          await this.app.vault.modify(existingFormatted, formattedNote);
+        } else {
+          await this.app.vault.create(formattedPath, formattedNote);
+        }
+        outputPath = formattedPath;
       }
       notice.setMessage(`\u2713 Converted to ${outputPath}`);
       setTimeout(() => notice.hide(), 3e3);
@@ -32744,13 +32893,22 @@ Then restart Obsidian.`, 1e4);
       notice?.hide();
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("Unauthorized") || message.includes("API key")) {
-        new import_obsidian5.Notice(`\u274C API Error: Invalid or expired API key. Please check your environment variables.`, 1e4);
+        new import_obsidian6.Notice(`\u274C API Error: Invalid or expired API key. Please check your environment variables.`, 1e4);
       } else if (message.includes("timeout")) {
-        new import_obsidian5.Notice(`\u274C Conversion timeout. Try increasing timeout in plugin settings or use a faster model.`, 1e4);
+        new import_obsidian6.Notice(`\u274C Conversion timeout. Try increasing timeout in plugin settings or use a faster model.`, 1e4);
       } else {
-        new import_obsidian5.Notice(`Error: ${message}`, 1e4);
+        new import_obsidian6.Notice(`Error: ${message}`, 1e4);
       }
       console.error("Conversion error:", error);
+    }
+  }
+  async ensureFolder(folder) {
+    let current = "";
+    for (const part of folder.split("/")) {
+      current = current ? `${current}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(current)) {
+        await this.app.vault.createFolder(current);
+      }
     }
   }
   getOutputPath(file) {
@@ -32856,15 +33014,15 @@ Then restart Obsidian.`, 1e4);
     try {
       const editor = this.app.workspace.activeEditor?.editor;
       if (!editor) {
-        new import_obsidian5.Notice("\u274C No active editor found");
+        new import_obsidian6.Notice("\u274C No active editor found");
         return;
       }
       const apiKey = this.getApiKey(this.settings.provider) ?? "";
       if (!apiKey && this.settings.provider !== "local") {
-        new import_obsidian5.Notice("\u274C API Key not configured");
+        new import_obsidian6.Notice("\u274C API Key not configured");
         return;
       }
-      const notice = new import_obsidian5.Notice("Converting image...", 0);
+      const notice = new import_obsidian6.Notice("Converting image...", 0);
       const imageData = await this.app.vault.readBinary(file);
       const provider = this.createProvider(apiKey);
       const converter = new PDFConverter(provider, {
@@ -32884,7 +33042,7 @@ Then restart Obsidian.`, 1e4);
         }
       }
       if (insertLine === -1) {
-        new import_obsidian5.Notice("\u274C Could not find image line in editor");
+        new import_obsidian6.Notice("\u274C Could not find image line in editor");
         return;
       }
       const newContent = lines.slice(0, insertLine + 1).join("\n") + "\n\n" + markdown + "\n\n" + lines.slice(insertLine + 1).join("\n");
@@ -32892,7 +33050,7 @@ Then restart Obsidian.`, 1e4);
       notice.setMessage(`\u2713 Image converted and inserted`);
       setTimeout(() => notice.hide(), 2e3);
     } catch (error) {
-      new import_obsidian5.Notice(`Error: ${error instanceof Error ? error.message : String(error)}`, 1e4);
+      new import_obsidian6.Notice(`Error: ${error instanceof Error ? error.message : String(error)}`, 1e4);
       console.error("Image conversion error:", error);
     }
   }
@@ -32900,26 +33058,26 @@ Then restart Obsidian.`, 1e4);
     try {
       const editor = this.app.workspace.activeEditor?.editor;
       if (!editor) {
-        new import_obsidian5.Notice("\u274C No active editor found");
+        new import_obsidian6.Notice("\u274C No active editor found");
         return;
       }
       const vaultPath = this.resolveImagePath(src);
       if (!vaultPath) {
-        new import_obsidian5.Notice("\u274C Could not resolve image path");
+        new import_obsidian6.Notice("\u274C Could not resolve image path");
         return;
       }
       const imageFile = this.app.vault.getAbstractFileByPath(vaultPath);
-      if (!imageFile || !(imageFile instanceof import_obsidian5.TFile)) {
-        new import_obsidian5.Notice("\u274C Image file not found in vault");
+      if (!imageFile || !(imageFile instanceof import_obsidian6.TFile)) {
+        new import_obsidian6.Notice("\u274C Image file not found in vault");
         return;
       }
       const imageData = await this.app.vault.readBinary(imageFile);
       const apiKey = this.getApiKey(this.settings.provider) ?? "";
       if (!apiKey && this.settings.provider !== "local") {
-        new import_obsidian5.Notice("\u274C API Key not configured");
+        new import_obsidian6.Notice("\u274C API Key not configured");
         return;
       }
-      const notice = new import_obsidian5.Notice("Converting image...", 0);
+      const notice = new import_obsidian6.Notice("Converting image...", 0);
       const provider = this.createProvider(apiKey);
       const converter = new PDFConverter(provider, {
         timeout: this.settings.timeout * 1e3,
@@ -32936,7 +33094,7 @@ Then restart Obsidian.`, 1e4);
         }
       }
       if (insertLine === -1) {
-        new import_obsidian5.Notice("\u274C Could not find image line in editor");
+        new import_obsidian6.Notice("\u274C Could not find image line in editor");
         return;
       }
       const newContent = lines.slice(0, insertLine + 1).join("\n") + "\n\n" + markdown + "\n\n" + lines.slice(insertLine + 1).join("\n");
@@ -32944,7 +33102,7 @@ Then restart Obsidian.`, 1e4);
       notice.setMessage(`\u2713 Image converted and inserted`);
       setTimeout(() => notice.hide(), 2e3);
     } catch (error) {
-      new import_obsidian5.Notice(`Error: ${error instanceof Error ? error.message : String(error)}`, 1e4);
+      new import_obsidian6.Notice(`Error: ${error instanceof Error ? error.message : String(error)}`, 1e4);
       console.error("Image conversion error:", error);
     }
   }

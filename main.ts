@@ -1,7 +1,8 @@
-import { Plugin, Notice, TFile, Menu, Platform } from 'obsidian';
+import { Plugin, Notice, TFile, Menu, Platform, normalizePath } from 'obsidian';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { PDFToMDSettings, PDFToMDSettingTab, DEFAULT_SETTINGS, MODEL_OPTIONS } from './src/settings';
 import { PDFConverter } from './src/converter';
+import { formatMarkdown, buildNote } from './src/formatter';
 import { ModelProvider } from './src/providers/base';
 import { OpenAICompatibleProvider } from './src/providers/openai-compat';
 import { AnthropicProvider } from './src/providers/anthropic';
@@ -187,23 +188,54 @@ export default class PDFToMDPlugin extends Plugin {
         markdown = await converter.convertImageBuffer(data);
       }
 
-      // Determine output path based on conflict resolution strategy
-      const outputPath = this.getOutputPath(file);
-
-      // Check if file exists
-      const existingFile = this.app.vault.getAbstractFileByPath(outputPath);
-
-      if (existingFile && this.settings.conflictResolution === 'skip') {
-        notice.hide();
-        new Notice(`File already exists: ${outputPath}. Skipped.`, 5000);
-        return;
+      // --- Pass 2: separate Gemini call to format + tag ---
+      let formattedNote: string | null = null;
+      if (this.settings.formatEnabled) {
+        const geminiKey = this.getApiKey('gemini');
+        if (!geminiKey) {
+          new Notice('⚠️ GEMINI_API_KEY not found, skipping formatting. Raw conversion will be saved.', 8000);
+        } else {
+          try {
+            notice.setMessage('Formatting and tagging...');
+            const result = await formatMarkdown(markdown, geminiKey, this.settings.timeout * 1000);
+            formattedNote = buildNote(result.markdown, result.tags, file.name);
+          } catch (e) {
+            console.error('Formatting error:', e);
+            new Notice(`⚠️ Formatting failed (${e instanceof Error ? e.message : e}). Raw conversion saved instead.`, 10000);
+          }
+        }
       }
 
-      // Create or overwrite file
-      if (existingFile && existingFile instanceof TFile) {
-        await this.app.vault.modify(existingFile, markdown);
-      } else {
-        await this.app.vault.create(outputPath, markdown);
+      // Raw output (always saved if formatting is off/failed, otherwise optional)
+      const saveRaw = !this.settings.formatEnabled || formattedNote === null || this.settings.keepRawFile;
+      let outputPath = '';
+      if (saveRaw) {
+        outputPath = this.getOutputPath(file);
+        const existingFile = this.app.vault.getAbstractFileByPath(outputPath);
+        if (existingFile && this.settings.conflictResolution === 'skip') {
+          notice.hide();
+          new Notice(`File already exists: ${outputPath}. Skipped.`, 5000);
+          return;
+        }
+        if (existingFile && existingFile instanceof TFile) {
+          await this.app.vault.modify(existingFile, markdown);
+        } else {
+          await this.app.vault.create(outputPath, markdown);
+        }
+      }
+
+      // Formatted output goes to its own folder, same file name as the source
+      if (formattedNote !== null) {
+        const folder = normalizePath(this.settings.formatFolder || 'Formatted Notes');
+        await this.ensureFolder(folder);
+        const formattedPath = `${folder}/${file.basename}.md`;
+        const existingFormatted = this.app.vault.getAbstractFileByPath(formattedPath);
+        if (existingFormatted instanceof TFile) {
+          await this.app.vault.modify(existingFormatted, formattedNote);
+        } else {
+          await this.app.vault.create(formattedPath, formattedNote);
+        }
+        outputPath = formattedPath;
       }
 
       notice.setMessage(`✓ Converted to ${outputPath}`);
@@ -222,6 +254,16 @@ export default class PDFToMDPlugin extends Plugin {
       }
 
       console.error('Conversion error:', error);
+    }
+  }
+
+  private async ensureFolder(folder: string) {
+    let current = '';
+    for (const part of folder.split('/')) {
+      current = current ? `${current}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(current)) {
+        await this.app.vault.createFolder(current);
+      }
     }
   }
 
