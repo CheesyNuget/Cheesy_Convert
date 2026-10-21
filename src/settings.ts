@@ -15,6 +15,7 @@ export const MODEL_OPTIONS: ModelOption[] = [
   { id: 'openai-gpt-4.1-mini', name: 'OpenAI GPT-4.1 Mini', provider: 'openai', apiModel: 'gpt-4.1-mini' },
   { id: 'openai-gpt-5.4-mini', name: 'OpenAI GPT-5.4 Mini', provider: 'openai', apiModel: 'gpt-5.4-mini' },
   { id: 'openai-gpt-5.4', name: 'OpenAI GPT-5.4', provider: 'openai', apiModel: 'gpt-5.4' },
+  { id: 'gemini-3.5-flash-lite', name: 'Google Gemini 3.5 Flash-Lite', provider: 'gemini', apiModel: 'gemini-3.5-flash-lite' },
   { id: 'gemini-3.5-flash', name: 'Google Gemini 3.5 Flash', provider: 'gemini', apiModel: 'gemini-3.5-flash' },
   { id: 'gemini-2.5-flash', name: 'Google Gemini 2.5 Flash', provider: 'gemini', apiModel: 'gemini-2.5-flash' },
   { id: 'gemini-2.5-flash-lite', name: 'Google Gemini 2.5 Flash-Lite Preview 06-17', provider: 'gemini', apiModel: 'gemini-2.5-flash-lite-preview-06-17' },
@@ -40,6 +41,9 @@ export interface PDFToMDSettings {
   dpi: number;
   timeout: number;
   conflictResolution: 'overwrite' | 'skip' | 'timestamp' | 'by-model';
+  formatEnabled: boolean;
+  formatFolder: string;
+  keepRawFile: boolean;
 }
 
 export const DEFAULT_SETTINGS: PDFToMDSettings = {
@@ -54,6 +58,9 @@ export const DEFAULT_SETTINGS: PDFToMDSettings = {
   dpi: 150,
   timeout: 60,
   conflictResolution: 'by-model',
+  formatEnabled: true,
+  formatFolder: 'Formatted Notes',
+  keepRawFile: true,
 };
 
 export class PDFToMDSettingTab extends PluginSettingTab {
@@ -173,6 +180,40 @@ export class PDFToMDSettingTab extends PluginSettingTab {
             this.plugin.settings.conflictResolution = value as any;
             await this.plugin.saveSettings();
           })
+      );
+
+    // Formatting pass (separate Gemini call)
+    new Setting(containerEl)
+      .setName('Format and tag with Gemini')
+      .setDesc('After conversion, send the text to gemini-3.5-flash-lite in a separate request to clean up formatting, add tags and tick-box "look into this" items. Needs GEMINI_API_KEY.')
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.formatEnabled).onChange(async value => {
+          this.plugin.settings.formatEnabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Formatted notes folder')
+      .setDesc('Vault folder for the formatted note (same file name as the PDF). Created if missing.')
+      .addText(text =>
+        text
+          .setPlaceholder('Formatted Notes')
+          .setValue(this.plugin.settings.formatFolder)
+          .onChange(async value => {
+            this.plugin.settings.formatFolder = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Keep raw conversion')
+      .setDesc('Also save the unformatted OCR markdown next to the PDF.')
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.keepRawFile).onChange(async value => {
+          this.plugin.settings.keepRawFile = value;
+          await this.plugin.saveSettings();
+        })
       );
   }
 
